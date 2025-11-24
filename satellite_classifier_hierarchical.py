@@ -18,6 +18,7 @@ from pathlib import Path
 import pickle
 from numba import jit, prange
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 warnings.filterwarnings('ignore', category=Warning)
 
 """
@@ -1005,37 +1006,27 @@ def main(auto_mode=False, test_image=None):
                                 all_patches.append(patch_resized)
                                 all_positions.append((i, j))
                         
-                        # OPTIMIZED BATCH PROCESSING (5-10K patches per batch)
-                        # Larger batches = better memory access patterns & less overhead
+                        # OPTIMIZED BATCH PROCESSING (8-10K patches/batch)
+                        FEATURE_BATCH = 8000      # Large batches for feature extraction
+                        CLASSIFY_BATCH = 10000    # Even larger for classification
+                        
                         print(f"   🚀 Processing {len(all_patches):,} patches in optimized batches...")
+                        start_total = time.time()
                         
-                        # Determine optimal batch size based on available memory
-                        FEATURE_EXTRACTION_BATCH = 8000  # Larger batches for feature extraction
-                        CLASSIFICATION_BATCH = 10000     # Even larger for classification (simpler ops)
-                        
-                        # STEP 2: Extract features in large batches (OPTIMIZED)
-                        print(f"   📦 Feature extraction batch size: {FEATURE_EXTRACTION_BATCH:,}")
+                        # STEP 2: Extract features sequentially (fastest for CPU-bound work)
                         all_features = []
-                        
-                        for batch_start in range(0, len(all_patches), FEATURE_EXTRACTION_BATCH):
-                            batch_end = min(batch_start + FEATURE_EXTRACTION_BATCH, len(all_patches))
+                        for batch_start in range(0, len(all_patches), FEATURE_BATCH):
+                            batch_end = min(batch_start + FEATURE_BATCH, len(all_patches))
                             batch_patches = all_patches[batch_start:batch_end]
-                            
-                            # Extract features for batch (NO FILE I/O!)
                             batch_features = [extract_features_from_array(patch) for patch in batch_patches]
                             all_features.extend(batch_features)
-                            
-                            print(f"   Progress: {batch_end:,}/{len(all_patches):,} patches ({100*batch_end/len(all_patches):.1f}%)...", end='\r')
                         
-                        print(f"\n   ✅ Feature extraction complete!")
-                        
-                        # STEP 3: Precompute classification parameters (do this ONCE)
+                        # STEP 3: Precompute classification parameters (ONCE)
                         K = len(model_data['class_names'])
-                        class_means = np.array(model_data['class_means'])  # Convert to numpy array (K, 43)
+                        class_means = np.array(model_data['class_means'])
                         class_covs = model_data['class_covariances']
                         class_priors = model_data['class_priors']
                         
-                        # Precompute inverse covariances and log determinants (ONCE, before loop)
                         inv_covs = np.array([np.linalg.inv(class_covs[k] + np.eye(43) * 1e-6) for k in range(K)])
                         log_dets = np.array([np.linalg.slogdet(class_covs[k])[1] for k in range(K)])
                         log_priors = np.log(class_priors)
@@ -1044,49 +1035,37 @@ def main(auto_mode=False, test_image=None):
                         mdc_votes = np.zeros((h, w, K), dtype=np.int32)
                         mlc_votes = np.zeros((h, w, K), dtype=np.int32)
                         
-                        # STEP 4: Process classification in large batches (OPTIMIZED)
-                        print(f"   📦 Classification batch size: {CLASSIFICATION_BATCH:,}")
-                        print(f"   🚀 Processing classification in batches (JIT-compiled)...")
+                        # STEP 4: Process in large batches (extract + scale + classify together)
+                        print(f"   🚀 Processing classification in {CLASSIFY_BATCH:,}-patch batches (JIT-compiled)...")
                         
-                        total_mdc_time = 0.0
-                        total_mlc_time = 0.0
-                        num_batches = 0
-                        
-                        for batch_start in range(0, len(all_features), CLASSIFICATION_BATCH):
-                            batch_end = min(batch_start + CLASSIFICATION_BATCH, len(all_features))
+                        for batch_start in range(0, len(all_features), CLASSIFY_BATCH):
+                            batch_end = min(batch_start + CLASSIFY_BATCH, len(all_features))
                             
                             # Extract and scale features for this batch
                             X_batch = np.array([f[selected_features_indices] for f in all_features[batch_start:batch_end]])
                             X_batch_scaled = model_data['scaler'].transform(X_batch)
                             
-                            # MDC Classification (JIT-compiled)
-                            start_mdc = time.time()
-                            distances_batch = compute_euclidean_distances_jit(X_batch_scaled, class_means)
-                            pred_mdc_batch = np.argmin(distances_batch, axis=1)
-                            total_mdc_time += time.time() - start_mdc
+                            # MDC Classification (JIT)
+                            distances = compute_euclidean_distances_jit(X_batch_scaled, class_means)
+                            pred_mdc_batch = np.argmin(distances, axis=1)
                             
-                            # MLC Classification (JIT-compiled)
-                            start_mlc = time.time()
-                            discriminants_batch = compute_mahalanobis_discriminants_jit(
+                            # MLC Classification (JIT)
+                            discriminants = compute_mahalanobis_discriminants_jit(
                                 X_batch_scaled, class_means, inv_covs, log_dets, log_priors
                             )
-                            pred_mlc_batch = np.argmax(discriminants_batch, axis=1)
-                            total_mlc_time += time.time() - start_mlc
+                            pred_mlc_batch = np.argmax(discriminants, axis=1)
                             
                             # Accumulate votes for this batch
                             batch_positions = all_positions[batch_start:batch_end]
                             for idx, (i, j) in enumerate(batch_positions):
                                 mdc_votes[i:i+patch_size, j:j+patch_size, pred_mdc_batch[idx]] += 1
                                 mlc_votes[i:i+patch_size, j:j+patch_size, pred_mlc_batch[idx]] += 1
-                            
-                            num_batches += 1
-                            print(f"   Batch {num_batches}: {batch_end:,}/{len(all_features):,} patches ({100*batch_end/len(all_features):.1f}%)...", end='\r')
                         
-                        print(f"\n   ✅ MDC completed in {total_mdc_time:.2f}s ({num_batches} batches)")
-                        print(f"   ✅ MLC completed in {total_mlc_time:.2f}s ({num_batches} batches)")
+                        total_time = time.time() - start_total
+                        print(f"   ✅ Complete! Processed {len(all_patches):,} patches in {total_time:.2f}s")
                         
-                        # STEP 8: Final classification (VECTORIZED)
-                        print(f"   🚀 Computing final classifications (vectorized)...")
+                        # STEP 5: Final classification (VECTORIZED)
+                        print(f"   🚀 Computing final classifications...")
                         classification_map_mdc_full = np.argmax(mdc_votes, axis=2).astype(np.uint8)
                         classification_map_mlc_full = np.argmax(mlc_votes, axis=2).astype(np.uint8)
                         
