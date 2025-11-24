@@ -1035,6 +1035,11 @@ def main(auto_mode=False, test_image=None):
                         mdc_votes = np.zeros((h, w, K), dtype=np.int32)
                         mlc_votes = np.zeros((h, w, K), dtype=np.int32)
                         
+                        # Store all scaled features and predictions for statistics computation
+                        all_scaled_features = []
+                        all_mdc_predictions = []
+                        all_mlc_predictions = []
+                        
                         # STEP 4: Process in large batches (extract + scale + classify together)
                         print(f"   🚀 Processing classification in {CLASSIFY_BATCH:,}-patch batches (JIT-compiled)...")
                         
@@ -1055,11 +1060,21 @@ def main(auto_mode=False, test_image=None):
                             )
                             pred_mlc_batch = np.argmax(discriminants, axis=1)
                             
+                            # Store for statistics computation
+                            all_scaled_features.extend(X_batch_scaled)
+                            all_mdc_predictions.extend(pred_mdc_batch)
+                            all_mlc_predictions.extend(pred_mlc_batch)
+                            
                             # Accumulate votes for this batch
                             batch_positions = all_positions[batch_start:batch_end]
                             for idx, (i, j) in enumerate(batch_positions):
                                 mdc_votes[i:i+patch_size, j:j+patch_size, pred_mdc_batch[idx]] += 1
                                 mlc_votes[i:i+patch_size, j:j+patch_size, pred_mlc_batch[idx]] += 1
+                        
+                        # Convert to numpy arrays for statistics
+                        all_scaled_features = np.array(all_scaled_features)
+                        all_mdc_predictions = np.array(all_mdc_predictions)
+                        all_mlc_predictions = np.array(all_mlc_predictions)
                         
                         total_time = time.time() - start_total
                         print(f"   ✅ Complete! Processed {len(all_patches):,} patches in {total_time:.2f}s")
@@ -1095,47 +1110,50 @@ def main(auto_mode=False, test_image=None):
                             colored_map_mdc[classification_map_mdc_full == class_id] = color
                             colored_map_mlc[classification_map_mlc_full == class_id] = color
                         
-                        # Calculate TEST IMAGE class statistics (not training stats!)
-                        print(f"\n📊 Computing test image statistics (using same 43-feature space as training)...")
+                        # Calculate TEST IMAGE class statistics for BOTH classifiers
+                        print(f"\n📊 Computing test image statistics for both classifiers...")
                         
                         # Convert image to feature space for visualization
                         img_hsv = cv2.cvtColor(original_img, cv2.COLOR_BGR2HSV)
+                        K = len(model_data['class_names'])
                         
-                        # Extract features from each classified region (test image)
-                        test_class_stats = []
-                        class_feature_vectors = []  # Store feature vectors in same space as training
+                        # ========== MDC STATISTICS ==========
+                        print(f"\n🔵 MDC (Minimum Distance Classifier) Statistics:")
+                        mdc_class_stats = []
+                        mdc_feature_vectors = []
                         
-                        # Use the same 43 selected features as training for consistency
                         for class_id, class_name in enumerate(model_data['class_names']):
-                            # Get pixels belonging to this class (using MLC)
-                            class_mask = (classification_map_mlc_full == class_id)
-                            pixel_count = int(np.sum(class_mask))
+                            # Get features of patches classified as this class by MDC
+                            mdc_class_mask = (all_mdc_predictions == class_id)
+                            pixel_count_mdc = int(np.sum(mdc_class_mask))
+                            
+                            # Get RGB/HSV stats from pixel-level classification map
+                            class_mask_mdc = (classification_map_mdc_full == class_id)
+                            pixel_count_mdc_pixels = int(np.sum(class_mask_mdc))
 
-                            if pixel_count > 0:
-                                # Get pixel values for visualization
-                                class_pixels_bgr = original_img[class_mask].astype(np.float64)
-                                class_pixels_hsv = img_hsv[class_mask].astype(np.float64)
+                            if pixel_count_mdc > 0 and pixel_count_mdc_pixels > 0:
+                                # Get pixel values from classified pixels
+                                class_pixels_bgr = original_img[class_mask_mdc].astype(np.float64)
+                                class_pixels_hsv = img_hsv[class_mask_mdc].astype(np.float64)
 
-                                # Calculate RGB statistics (for display only)
                                 mean_rgb = np.mean(class_pixels_bgr, axis=0)
                                 std_rgb = np.std(class_pixels_bgr, axis=0)
                                 mean_hsv = np.mean(class_pixels_hsv, axis=0)
                                 std_hsv = np.std(class_pixels_hsv, axis=0)
                                 
-                                # USE TRAINING FEATURE SPACE: Get mean feature vector in the same 43D space
-                                # This is the class mean from trained model (already in 43-feature scaled space)
-                                feature_vector = model_data['class_means'][class_id]  # 43 features
-                                class_feature_vectors.append(feature_vector)
+                                # Get feature vectors from patches classified as this class by MDC
+                                mdc_class_features = all_scaled_features[mdc_class_mask]
+                                feature_vector = np.mean(mdc_class_features, axis=0)
+                                mdc_feature_vectors.append(feature_vector)
                                 
-                                # Within-class variation from training covariance matrix
-                                class_cov = model_data['class_covariances'][class_id]
-                                within_class_var = np.mean(np.diag(class_cov))  # Average variance across features
+                                # Compute within-class variation from actual MDC-classified patches
+                                within_class_var = np.mean(np.var(mdc_class_features, axis=0))
                                 
-                                test_class_stats.append({
+                                mdc_class_stats.append({
                                     'class': class_name,
                                     'class_id': class_id,
-                                    'pixel_count': pixel_count,
-                                    'percentage': (pixel_count / (h*w)) * 100,
+                                    'pixel_count': pixel_count_mdc_pixels,
+                                    'percentage': (pixel_count_mdc_pixels / (h*w)) * 100,
                                     'mean_rgb': mean_rgb.tolist(),
                                     'std_rgb': std_rgb.tolist(),
                                     'mean_hsv': mean_hsv.tolist(),
@@ -1144,17 +1162,14 @@ def main(auto_mode=False, test_image=None):
                                     'within_class_variation': within_class_var
                                 })
                             else:
-                                # No pixels predicted for this class in test image
-                                print(f"   ⚠️ No pixels for class '{class_name}' in test image — using training stats.")
-                                
-                                # Use training statistics directly
+                                print(f"   ⚠️ MDC: No pixels for class '{class_name}' - using training stats.")
                                 feature_vector = model_data['class_means'][class_id]
-                                class_feature_vectors.append(feature_vector)
+                                mdc_feature_vectors.append(feature_vector)
                                 
                                 class_cov = model_data['class_covariances'][class_id]
                                 within_class_var = np.mean(np.diag(class_cov))
                                 
-                                test_class_stats.append({
+                                mdc_class_stats.append({
                                     'class': class_name,
                                     'class_id': class_id,
                                     'pixel_count': 0,
@@ -1167,121 +1182,210 @@ def main(auto_mode=False, test_image=None):
                                     'within_class_variation': within_class_var
                                 })
                         
-                        # Compute between-class separations and within-class variances
-                        print(f"\n🔎 Computing per-class statistics in 43-feature space...")
-                        class_feature_vectors_array = np.array(class_feature_vectors, dtype=np.float64)
-
-                        # Between-class separations: mean distance from each class to all other classes
-                        K = len(model_data['class_names'])
-                        between_seps = np.zeros((K, K), dtype=np.float64)
+                        # Compute MDC between-class separations
+                        mdc_feature_vectors_array = np.array(mdc_feature_vectors, dtype=np.float64)
+                        mdc_between_seps = np.zeros((K, K), dtype=np.float64)
                         for i in range(K):
                             for j in range(K):
-                                between_seps[i, j] = np.linalg.norm(class_feature_vectors_array[i] - class_feature_vectors_array[j])
+                                mdc_between_seps[i, j] = np.linalg.norm(mdc_feature_vectors_array[i] - mdc_feature_vectors_array[j])
 
-                        # For each class, compute mean distance to OTHER classes (not itself)
-                        between_class_summary = []
+                        mdc_between_class_summary = []
                         for i in range(K):
-                            # Get distances to all other classes (exclude self)
-                            other_distances = [between_seps[i, j] for j in range(K) if i != j]
+                            other_distances = [mdc_between_seps[i, j] for j in range(K) if i != j]
                             mean_dist = np.mean(other_distances) if other_distances else 0.0
-                            between_class_summary.append(mean_dist)
+                            mdc_between_class_summary.append(mean_dist)
                         
-                        # Update test_class_stats with correct per-class between-class separation
-                        for idx, stat in enumerate(test_class_stats):
-                            stat['between_class_separation'] = between_class_summary[idx]
+                        for idx, stat in enumerate(mdc_class_stats):
+                            stat['between_class_separation'] = mdc_between_class_summary[idx]
                         
-                        print(f"   ✅ Test image statistics computed!")
-                        for stat in test_class_stats:
+                        print(f"   ✅ MDC statistics computed:")
+                        for stat in mdc_class_stats:
                             print(f"      {stat['class']}: Between-class={stat['between_class_separation']:.2f}, Within-class={stat['within_class_variation']:.2f}")
+                        
+                        # ========== MLC STATISTICS ==========
+                        print(f"\n🟢 MLC (Maximum Likelihood Classifier) Statistics:")
+                        mlc_class_stats = []
+                        mlc_feature_vectors = []
+                        
+                        for class_id, class_name in enumerate(model_data['class_names']):
+                            # Get features of patches classified as this class by MLC
+                            mlc_class_mask = (all_mlc_predictions == class_id)
+                            pixel_count_mlc = int(np.sum(mlc_class_mask))
+                            
+                            # Get RGB/HSV stats from pixel-level classification map
+                            class_mask_mlc = (classification_map_mlc_full == class_id)
+                            pixel_count_mlc_pixels = int(np.sum(class_mask_mlc))
 
-                        # Within-class variation: USE THE VALUES ALREADY COMPUTED FROM TRAINING
-                        within_class_vars = [stat['within_class_variation'] for stat in test_class_stats]
+                            if pixel_count_mlc > 0 and pixel_count_mlc_pixels > 0:
+                                # Get pixel values from MLC-classified pixels
+                                class_pixels_bgr = original_img[class_mask_mlc].astype(np.float64)
+                                class_pixels_hsv = img_hsv[class_mask_mlc].astype(np.float64)
+
+                                mean_rgb = np.mean(class_pixels_bgr, axis=0)
+                                std_rgb = np.std(class_pixels_bgr, axis=0)
+                                mean_hsv = np.mean(class_pixels_hsv, axis=0)
+                                std_hsv = np.std(class_pixels_hsv, axis=0)
+                                
+                                # Get feature vectors from patches classified as this class by MLC
+                                mlc_class_features = all_scaled_features[mlc_class_mask]
+                                feature_vector = np.mean(mlc_class_features, axis=0)
+                                mlc_feature_vectors.append(feature_vector)
+                                
+                                # Compute within-class variation from actual MLC-classified patches
+                                within_class_var = np.mean(np.var(mlc_class_features, axis=0))
+                                
+                                mlc_class_stats.append({
+                                    'class': class_name,
+                                    'class_id': class_id,
+                                    'pixel_count': pixel_count_mlc_pixels,
+                                    'percentage': (pixel_count_mlc_pixels / (h*w)) * 100,
+                                    'mean_rgb': mean_rgb.tolist(),
+                                    'std_rgb': std_rgb.tolist(),
+                                    'mean_hsv': mean_hsv.tolist(),
+                                    'std_hsv': std_hsv.tolist(),
+                                    'feature_vector': feature_vector,
+                                    'within_class_variation': within_class_var
+                                })
+                            else:
+                                print(f"   ⚠️ MLC: No pixels for class '{class_name}' - using training stats.")
+                                feature_vector = model_data['class_means'][class_id]
+                                mlc_feature_vectors.append(feature_vector)
+                                
+                                class_cov = model_data['class_covariances'][class_id]
+                                within_class_var = np.mean(np.diag(class_cov))
+                                
+                                mlc_class_stats.append({
+                                    'class': class_name,
+                                    'class_id': class_id,
+                                    'pixel_count': 0,
+                                    'percentage': 0.0,
+                                    'mean_rgb': [128, 128, 128],
+                                    'std_rgb': [0, 0, 0],
+                                    'mean_hsv': [0, 0, 0],
+                                    'std_hsv': [0, 0, 0],
+                                    'feature_vector': feature_vector,
+                                    'within_class_variation': within_class_var
+                                })
+                        
+                        # Compute MLC between-class separations
+                        mlc_feature_vectors_array = np.array(mlc_feature_vectors, dtype=np.float64)
+                        mlc_between_seps = np.zeros((K, K), dtype=np.float64)
+                        for i in range(K):
+                            for j in range(K):
+                                mlc_between_seps[i, j] = np.linalg.norm(mlc_feature_vectors_array[i] - mlc_feature_vectors_array[j])
+
+                        mlc_between_class_summary = []
+                        for i in range(K):
+                            other_distances = [mlc_between_seps[i, j] for j in range(K) if i != j]
+                            mean_dist = np.mean(other_distances) if other_distances else 0.0
+                            mlc_between_class_summary.append(mean_dist)
+                        
+                        for idx, stat in enumerate(mlc_class_stats):
+                            stat['between_class_separation'] = mlc_between_class_summary[idx]
+                        
+                        print(f"   ✅ MLC statistics computed:")
+                        for stat in mlc_class_stats:
+                            print(f"      {stat['class']}: Between-class={stat['between_class_separation']:.2f}, Within-class={stat['within_class_variation']:.2f}")
 
                         # Save test statistics into a dedicated folder under OUTPUT_FOLDER
                         test_stats_dir = os.path.join(OUTPUT_FOLDER, 'test_stats')
                         os.makedirs(test_stats_dir, exist_ok=True)
 
-                        # Save per-class test stats CSV
+                        # Save COMBINED MDC + MLC statistics to CSV
                         stats_out_path = os.path.join(test_stats_dir, 'test_image_class_stats.csv')
                         rows = []
-                        for s, sep, wvar in zip(test_class_stats, between_class_summary, within_class_vars):
+                        for mdc_stat, mlc_stat in zip(mdc_class_stats, mlc_class_stats):
                             rows.append({
-                                'Class': s['class'],
-                                'Pixel_Count': int(s['pixel_count']),
-                                'Percentage': float(s['percentage']),
-                                'Mean_R_RGB': float(s['mean_rgb'][0]) if len(s['mean_rgb'])>=1 else 0.0,
-                                'Mean_G_RGB': float(s['mean_rgb'][1]) if len(s['mean_rgb'])>=2 else 0.0,
-                                'Mean_B_RGB': float(s['mean_rgb'][2]) if len(s['mean_rgb'])>=3 else 0.0,
-                                'Within_Class_Var': float(wvar),
-                                'Between_Class_Sep': float(sep)
+                                'Class': mdc_stat['class'],
+                                'MDC_Pixel_Count': int(mdc_stat['pixel_count']),
+                                'MDC_Percentage': float(mdc_stat['percentage']),
+                                'MDC_Between_Class_Sep': float(mdc_stat['between_class_separation']),
+                                'MDC_Within_Class_Var': float(mdc_stat['within_class_variation']),
+                                'MLC_Pixel_Count': int(mlc_stat['pixel_count']),
+                                'MLC_Percentage': float(mlc_stat['percentage']),
+                                'MLC_Between_Class_Sep': float(mlc_stat['between_class_separation']),
+                                'MLC_Within_Class_Var': float(mlc_stat['within_class_variation'])
                             })
 
                         stats_df_test = pd.DataFrame(rows)
                         stats_df_test.to_csv(stats_out_path, index=False)
-                        print(f"   ✅ Test image statistics saved to: {stats_out_path}")
+                        print(f"   ✅ Test image statistics (MDC + MLC) saved to: {stats_out_path}")
+                        
+                        # For visualization, use MLC stats as primary
+                        test_class_stats = mlc_class_stats
+                        between_class_summary = mlc_between_class_summary
+                        within_class_vars = [stat['within_class_variation'] for stat in mlc_class_stats]
 
-                        # Create visualization for test image class statistics
+                        # Create visualization for test image class statistics (MDC vs MLC comparison)
                         fig_stats = plt.figure(figsize=(16, 10))
                         gs_stats = fig_stats.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
                         
-                        # 1. Class Distribution (Percentage)
-                        ax_dist = fig_stats.add_subplot(gs_stats[0, 0])
-                        class_names_plot = [s['class'] for s in test_class_stats]
-                        percentages = [s['percentage'] for s in test_class_stats]
-                        colors_bars = [class_colors_normalized[i] for i in range(len(class_names_plot))]
+                        # Extract data for both classifiers
+                        class_names_plot = [s['class'] for s in mlc_class_stats]
+                        mdc_percentages = [s['percentage'] for s in mdc_class_stats]
+                        mlc_percentages = [s['percentage'] for s in mlc_class_stats]
+                        mdc_pixel_counts = [s['pixel_count'] for s in mdc_class_stats]
+                        mlc_pixel_counts = [s['pixel_count'] for s in mlc_class_stats]
+                        mdc_between_seps = [s['between_class_separation'] for s in mdc_class_stats]
+                        mlc_between_seps = [s['between_class_separation'] for s in mlc_class_stats]
+                        mdc_within_vars = [s['within_class_variation'] for s in mdc_class_stats]
+                        mlc_within_vars = [s['within_class_variation'] for s in mlc_class_stats]
                         
-                        bars1 = ax_dist.bar(class_names_plot, percentages, color=colors_bars, alpha=0.7, edgecolor='black', linewidth=2)
-                        ax_dist.set_ylabel('Percentage of Image (%)', fontsize=12, fontweight='bold')
-                        ax_dist.set_title('Test Image: Class Distribution', fontsize=14, fontweight='bold')
-                        ax_dist.set_ylim(0, max(percentages) * 1.2 if max(percentages) > 0 else 100)
+                        # 1. Class Distribution Comparison (MDC vs MLC)
+                        ax_dist = fig_stats.add_subplot(gs_stats[0, 0])
+                        x_pos = np.arange(len(class_names_plot))
+                        width = 0.35
+                        
+                        bars1_mdc = ax_dist.bar(x_pos - width/2, mdc_percentages, width, label='MDC', color='steelblue', alpha=0.7, edgecolor='black', linewidth=1.5)
+                        bars1_mlc = ax_dist.bar(x_pos + width/2, mlc_percentages, width, label='MLC', color='coral', alpha=0.7, edgecolor='black', linewidth=1.5)
+                        
+                        ax_dist.set_ylabel('Percentage of Image (%)', fontsize=11, fontweight='bold')
+                        ax_dist.set_title('Class Distribution: MDC vs MLC', fontsize=13, fontweight='bold')
+                        ax_dist.set_xticks(x_pos)
+                        ax_dist.set_xticklabels(class_names_plot, fontsize=10)
+                        ax_dist.legend(fontsize=10, loc='upper right')
                         ax_dist.grid(axis='y', alpha=0.3)
                         
-                        for bar, pct in zip(bars1, percentages):
-                            height = bar.get_height()
-                            ax_dist.text(bar.get_x() + bar.get_width()/2., height,
-                                        f'{pct:.1f}%', ha='center', va='bottom', fontweight='bold', fontsize=11)
-                        
-                        # 2. Pixel Counts
+                        # 2. Pixel Counts Comparison
                         ax_pixels = fig_stats.add_subplot(gs_stats[0, 1])
-                        pixel_counts = [s['pixel_count'] for s in test_class_stats]
                         
-                        bars2 = ax_pixels.bar(class_names_plot, pixel_counts, color=colors_bars, alpha=0.7, edgecolor='black', linewidth=2)
-                        ax_pixels.set_ylabel('Number of Pixels', fontsize=12, fontweight='bold')
-                        ax_pixels.set_title('Test Image: Pixel Count per Class', fontsize=14, fontweight='bold')
+                        bars2_mdc = ax_pixels.bar(x_pos - width/2, mdc_pixel_counts, width, label='MDC', color='steelblue', alpha=0.7, edgecolor='black', linewidth=1.5)
+                        bars2_mlc = ax_pixels.bar(x_pos + width/2, mlc_pixel_counts, width, label='MLC', color='coral', alpha=0.7, edgecolor='black', linewidth=1.5)
+                        
+                        ax_pixels.set_ylabel('Number of Pixels', fontsize=11, fontweight='bold')
+                        ax_pixels.set_title('Pixel Count per Class: MDC vs MLC', fontsize=13, fontweight='bold')
+                        ax_pixels.set_xticks(x_pos)
+                        ax_pixels.set_xticklabels(class_names_plot, fontsize=10)
+                        ax_pixels.legend(fontsize=10, loc='upper right')
                         ax_pixels.grid(axis='y', alpha=0.3)
                         
-                        for bar, count in zip(bars2, pixel_counts):
-                            height = bar.get_height()
-                            ax_pixels.text(bar.get_x() + bar.get_width()/2., height,
-                                          f'{count:,}', ha='center', va='bottom', fontweight='bold', fontsize=10)
-                        
-                        # 3. Between-Class Separation
+                        # 3. Between-Class Separation Comparison
                         ax_between = fig_stats.add_subplot(gs_stats[1, 0])
                         
-                        bars3 = ax_between.bar(class_names_plot, between_class_summary, color='steelblue', alpha=0.7, edgecolor='black', linewidth=2)
-                        ax_between.set_ylabel('Separation Distance', fontsize=12, fontweight='bold')
-                        ax_between.set_title('Between-Class Separation (Higher = Better)', fontsize=14, fontweight='bold')
+                        bars3_mdc = ax_between.bar(x_pos - width/2, mdc_between_seps, width, label='MDC', color='steelblue', alpha=0.7, edgecolor='black', linewidth=1.5)
+                        bars3_mlc = ax_between.bar(x_pos + width/2, mlc_between_seps, width, label='MLC', color='coral', alpha=0.7, edgecolor='black', linewidth=1.5)
+                        
+                        ax_between.set_ylabel('Separation Distance', fontsize=11, fontweight='bold')
+                        ax_between.set_title('Between-Class Separation: MDC vs MLC (Higher = Better)', fontsize=13, fontweight='bold')
+                        ax_between.set_xticks(x_pos)
+                        ax_between.set_xticklabels(class_names_plot, fontsize=10)
+                        ax_between.legend(fontsize=10, loc='upper right')
                         ax_between.grid(axis='y', alpha=0.3)
                         
-                        for bar, sep in zip(bars3, between_class_summary):
-                            height = bar.get_height()
-                            ax_between.text(bar.get_x() + bar.get_width()/2., height,
-                                           f'{sep:.1f}', ha='center', va='bottom', fontweight='bold', fontsize=11)
-                        
-                        # 4. Within-Class Variation
+                        # 4. Within-Class Variation Comparison
                         ax_within = fig_stats.add_subplot(gs_stats[1, 1])
                         
-                        bars4 = ax_within.bar(class_names_plot, within_class_vars, color='coral', alpha=0.7, edgecolor='black', linewidth=2)
-                        ax_within.set_ylabel('Variation (Std Dev)', fontsize=12, fontweight='bold')
-                        ax_within.set_title('Within-Class Variation (Lower = Better)', fontsize=14, fontweight='bold')
+                        bars4_mdc = ax_within.bar(x_pos - width/2, mdc_within_vars, width, label='MDC', color='steelblue', alpha=0.7, edgecolor='black', linewidth=1.5)
+                        bars4_mlc = ax_within.bar(x_pos + width/2, mlc_within_vars, width, label='MLC', color='coral', alpha=0.7, edgecolor='black', linewidth=1.5)
+                        
+                        ax_within.set_ylabel('Variation (Std Dev)', fontsize=11, fontweight='bold')
+                        ax_within.set_title('Within-Class Variation: MDC vs MLC (Lower = Better)', fontsize=13, fontweight='bold')
+                        ax_within.set_xticks(x_pos)
+                        ax_within.set_xticklabels(class_names_plot, fontsize=10)
+                        ax_within.legend(fontsize=10, loc='upper right')
                         ax_within.grid(axis='y', alpha=0.3)
                         
-                        for bar, var in zip(bars4, within_class_vars):
-                            height = bar.get_height()
-                            ax_within.text(bar.get_x() + bar.get_width()/2., height,
-                                          f'{var:.1f}', ha='center', va='bottom', fontweight='bold', fontsize=11)
-                        
-                        fig_stats.suptitle('Test Image: Class Statistics Analysis', fontsize=16, fontweight='bold', y=0.98)
+                        fig_stats.suptitle('Test Image: MDC vs MLC Statistics Comparison', fontsize=16, fontweight='bold', y=0.98)
                         
                         # Save the test statistics visualization
                         stats_png_path = os.path.join(test_stats_dir, 'test_image_class_stats.png')
