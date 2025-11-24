@@ -12,6 +12,8 @@ __pycache__/
 
 # Model and output files
 trained_model_hierarchical.pkl
+# output/
+# image*.jpg
 
 # OS files
 .DS_Store
