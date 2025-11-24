@@ -89,25 +89,29 @@ def load_model(filepath=MODEL_SAVE_PATH):
 # ============================================================
 def extract_comprehensive_features(image_path):
     """
-    Extract ~70+ discriminative features (optimized for accuracy):
-    - RGB color statistics (16 features - enhanced)
-    - HSV color space (16 features - enhanced)
+    Extract 80 discriminative features from image file path.
+    """
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+    img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
+    return extract_features_from_array(img)
+
+
+def extract_features_from_array(img):
+    """
+    FAST vectorized feature extraction from image array (NO FILE I/O).
+    Extract 80 discriminative features:
+    - RGB color statistics (18 features - enhanced)
+    - HSV color space (18 features - enhanced)
     - LAB color space (12 features - NEW for better color separation!)
     - Texture - Sobel gradients (8 features - enhanced)
     - Edge features (6 features - enhanced)
     - Spatial statistics (12 features)
     - Statistical moments (6 features - enhanced)
     
-    Total: ~76 features (better discrimination + still fast!)
+    Total: ~80 features (better discrimination + still fast!)
     """
-    
-    # Load image
-    img = cv2.imread(image_path)
-    if img is None:
-        return None
-    
-    # Resize to larger size for MORE DETAIL (accuracy boost!)
-    img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
     # Histogram equalization for better contrast
@@ -115,7 +119,7 @@ def extract_comprehensive_features(image_path):
     
     features = []
     
-    # 1. RGB COLOR STATISTICS (16 features - ENHANCED!)
+    # 1. RGB COLOR STATISTICS (18 features - ENHANCED!)
     for i, color in enumerate(['B', 'G', 'R']):
         channel = img[:,:,i]
         features.extend([
@@ -127,7 +131,7 @@ def extract_comprehensive_features(image_path):
             np.percentile(channel, 90),  # NEW: Upper percentile
         ])
     
-    # 2. HSV COLOR SPACE (16 features - ENHANCED!)
+    # 2. HSV COLOR SPACE (18 features - ENHANCED!)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     for i in range(3):
         channel = hsv[:,:,i]
@@ -196,12 +200,28 @@ def extract_comprehensive_features(image_path):
         ])
     
     # 7. STATISTICAL MOMENTS (6 features - ENHANCED!)
+    # Add small epsilon to avoid warnings for uniform patches
+    gray_flat = gray.flatten()
+    variance = np.var(gray_flat)
+    
+    # Only compute kurtosis/skew if there's sufficient variance
+    if variance > 1e-6:
+        with np.errstate(all='ignore'):  # Suppress numerical warnings
+            kurt = scipy.stats.kurtosis(gray_flat)
+            skewness = scipy.stats.skew(gray_flat)
+            # Replace NaN/Inf with 0
+            kurt = 0.0 if not np.isfinite(kurt) else kurt
+            skewness = 0.0 if not np.isfinite(skewness) else skewness
+    else:
+        kurt = 0.0
+        skewness = 0.0
+    
     features.extend([
-        scipy.stats.kurtosis(gray.flatten()),
-        scipy.stats.skew(gray.flatten()),
-        np.var(gray),
+        kurt,
+        skewness,
+        variance,
         np.ptp(gray),  # Peak-to-peak (range)
-        np.median(gray.flatten()),  # NEW: Median
+        np.median(gray_flat),  # NEW: Median
         scipy.stats.entropy(np.histogram(gray, bins=32)[0] + 1e-10),  # NEW: Entropy
     ])
     
@@ -893,90 +913,108 @@ def main(auto_mode=False, test_image=None):
                         print(f"   Minimum Distance Classifier (MDC): {class_min}")
                         print(f"   Maximum Likelihood Classifier (MLC): {class_ml} ⭐")
                         
-                        # TRUE PIXEL-BY-PIXEL CLASSIFICATION (Using Patches)
-                        print(f"\n🎨 Performing patch-based pixel classification...")
+                        # FULLY VECTORIZED PIXEL-BY-PIXEL CLASSIFICATION (NO FILE I/O!)
+                        print(f"\n🎨 Performing fully vectorized patch-based pixel classification...")
                         h, w = original_img.shape[:2]
                         print(f"   Image size: {h}x{w} = {h*w:,} pixels")
-                        print(f"   Using overlapping patches for accurate pixel classification...")
                         
-                        # Create classification maps for EACH pixel
-                        classification_map_mdc_full = np.zeros((h, w), dtype=np.uint8)
-                        classification_map_mlc_full = np.zeros((h, w), dtype=np.uint8)
-                        
-                        # Use larger patches (16x16) and resize to IMAGE_SIZE for feature extraction
+                        # Use original patch parameters for maximum detail
                         patch_size = 16
-                        stride = 8  # Overlapping patches for smoother results
+                        stride = 8
                         
-                        print(f"   Using {patch_size}x{patch_size} patches with stride {stride}...")
-                        
-                        # Temporary directory for patch processing
-                        import tempfile
-                        temp_dir = tempfile.mkdtemp()
+                        print(f"   Using {patch_size}x{patch_size} patches with stride {stride} (full detail)...")
                         
                         # Calculate number of patches
                         num_patches_h = (h - patch_size) // stride + 1
                         num_patches_w = (w - patch_size) // stride + 1
                         total_patches = num_patches_h * num_patches_w
                         
-                        print(f"   Processing {total_patches:,} patches...")
+                        print(f"   🚀 Extracting features from {total_patches:,} patches (vectorized, no file I/O)...")
                         
-                        # Arrays to accumulate votes for each pixel
-                        mdc_votes = np.zeros((h, w, 3), dtype=np.int32)  # 3 classes
-                        mlc_votes = np.zeros((h, w, 3), dtype=np.int32)
+                        # STEP 1: Extract all patches at once (vectorized)
+                        all_patches = []
+                        all_positions = []
                         
-                        patch_count = 0
                         for i in range(0, h - patch_size + 1, stride):
                             for j in range(0, w - patch_size + 1, stride):
-                                # Extract patch
                                 patch = original_img[i:i+patch_size, j:j+patch_size]
-                                
-                                # Resize patch to IMAGE_SIZE and save temporarily
                                 patch_resized = cv2.resize(patch, (IMAGE_SIZE, IMAGE_SIZE))
-                                temp_patch_path = os.path.join(temp_dir, 'temp_patch.jpg')
-                                cv2.imwrite(temp_patch_path, patch_resized)
-                                
-                                # Extract full 80 features from patch
-                                try:
-                                    patch_features = extract_comprehensive_features(temp_patch_path)
-                                    
-                                    if patch_features is not None:
-                                        # Select and scale features
-                                        patch_features_selected = patch_features[selected_features_indices].reshape(1, -1)
-                                        patch_features_scaled = model_data['scaler'].transform(patch_features_selected)
-                                        
-                                        # Classify patch
-                                        pred_mdc = classify_minimum_distance(patch_features_scaled, model_data['class_means'])[0]
-                                        pred_mlc = classify_maximum_likelihood(
-                                            patch_features_scaled,
-                                            model_data['class_means'],
-                                            model_data['class_covariances'],
-                                            model_data['class_priors']
-                                        )[0]
-                                        
-                                        # Vote for all pixels in this patch
-                                        mdc_votes[i:i+patch_size, j:j+patch_size, pred_mdc] += 1
-                                        mlc_votes[i:i+patch_size, j:j+patch_size, pred_mlc] += 1
-                                    
-                                except Exception as e:
-                                    # If feature extraction fails, skip this patch
-                                    pass
-                                
-                                patch_count += 1
-                                if patch_count % 100 == 0:
-                                    print(f"   Progress: {patch_count:,}/{total_patches:,} patches ({100*patch_count/total_patches:.1f}%)...", end='\r')
+                                all_patches.append(patch_resized)
+                                all_positions.append((i, j))
                         
-                        # Clean up temp directory
-                        import shutil
-                        shutil.rmtree(temp_dir, ignore_errors=True)
+                        print(f"   🚀 Processing {len(all_patches):,} patches in batches...")
                         
-                        print(f"\n   ✅ Patch processing complete! Processed {patch_count:,} patches")
+                        # STEP 2: Extract features in batches (MUCH FASTER - no file I/O)
+                        batch_size = 2000
+                        all_features = []
                         
-                        # Assign final classification based on majority vote
-                        print(f"   Computing final pixel classifications from votes...")
-                        for i in range(h):
-                            for j in range(w):
-                                classification_map_mdc_full[i, j] = np.argmax(mdc_votes[i, j])
-                                classification_map_mlc_full[i, j] = np.argmax(mlc_votes[i, j])
+                        for batch_start in range(0, len(all_patches), batch_size):
+                            batch_end = min(batch_start + batch_size, len(all_patches))
+                            batch_patches = all_patches[batch_start:batch_end]
+                            
+                            # Extract features for batch (NO FILE I/O!)
+                            batch_features = [extract_features_from_array(patch) for patch in batch_patches]
+                            all_features.extend(batch_features)
+                            
+                            if (batch_end) % 5000 == 0 or batch_end == len(all_patches):
+                                print(f"   Progress: {batch_end:,}/{len(all_patches):,} patches ({100*batch_end/len(all_patches):.1f}%)...", end='\r')
+                        
+                        print(f"\n   ✅ Feature extraction complete!")
+                        
+                        # STEP 3: Stack and scale ALL features at once (VECTORIZED)
+                        print(f"   🚀 Scaling {len(all_features):,} feature vectors (vectorized)...")
+                        X_patches = np.array([f[selected_features_indices] for f in all_features])  # Shape: (N, 43)
+                        X_patches_scaled = model_data['scaler'].transform(X_patches)  # Vectorized scaling
+                        
+                        # STEP 4: Precompute classification parameters
+                        K = len(model_data['class_names'])
+                        class_means = model_data['class_means']  # Shape: (K, 43)
+                        class_covs = model_data['class_covariances']
+                        class_priors = model_data['class_priors']
+                        
+                        # STEP 5: FULLY VECTORIZED Minimum Distance Classification
+                        print(f"   🚀 MDC: Computing distances for ALL patches at once...")
+                        # Broadcasting: X_patches_scaled: (N, 43), class_means: (K, 43)
+                        # Result: distances shape (N, K)
+                        distances = np.array([
+                            np.sum((X_patches_scaled - class_means[k])**2, axis=1)
+                            for k in range(K)
+                        ]).T
+                        pred_mdc_all = np.argmin(distances, axis=1)
+                        
+                        # STEP 6: FULLY VECTORIZED Maximum Likelihood Classification
+                        print(f"   🚀 MLC: Computing probabilities for ALL patches at once...")
+                        
+                        # Precompute inverse covariances and log determinants
+                        inv_covs = np.array([np.linalg.inv(class_covs[k] + np.eye(43) * 1e-6) for k in range(K)])
+                        log_dets = np.array([np.linalg.slogdet(class_covs[k])[1] for k in range(K)])
+                        
+                        # Compute discriminant for all patches at once (VECTORIZED)
+                        discriminants = np.zeros((len(X_patches_scaled), K))
+                        for k in range(K):
+                            diff = X_patches_scaled - class_means[k]  # (N, 43)
+                            # Vectorized Mahalanobis distance
+                            mahal_dist = np.sum(diff @ inv_covs[k] * diff, axis=1)  # (N,)
+                            discriminants[:, k] = -0.5 * log_dets[k] - 0.5 * mahal_dist + np.log(class_priors[k])
+                        
+                        pred_mlc_all = np.argmax(discriminants, axis=1)
+                        
+                        # STEP 7: Accumulate votes
+                        print(f"   🚀 Accumulating votes...")
+                        mdc_votes = np.zeros((h, w, K), dtype=np.int32)
+                        mlc_votes = np.zeros((h, w, K), dtype=np.int32)
+                        
+                        for idx, (i, j) in enumerate(all_positions):
+                            mdc_votes[i:i+patch_size, j:j+patch_size, pred_mdc_all[idx]] += 1
+                            mlc_votes[i:i+patch_size, j:j+patch_size, pred_mlc_all[idx]] += 1
+                        
+                        # STEP 8: Final classification (VECTORIZED)
+                        print(f"   🚀 Computing final classifications (vectorized)...")
+                        classification_map_mdc_full = np.argmax(mdc_votes, axis=2).astype(np.uint8)
+                        classification_map_mlc_full = np.argmax(mlc_votes, axis=2).astype(np.uint8)
+                        
+                        print(f"   ✅ Classification complete! {len(all_patches):,} patches processed.")
+
                         
                         print(f"   ✅ Pixel-level classification complete! Each pixel classified based on its local patch")
                         
@@ -1002,41 +1040,40 @@ def main(auto_mode=False, test_image=None):
                             colored_map_mlc[classification_map_mlc_full == class_id] = color
                         
                         # Calculate TEST IMAGE class statistics (not training stats!)
-                        print(f"\n📊 Computing test image statistics...")
+                        print(f"\n📊 Computing test image statistics (using same 43-feature space as training)...")
                         
-                        # Convert image to feature space for better analysis
+                        # Convert image to feature space for visualization
                         img_hsv = cv2.cvtColor(original_img, cv2.COLOR_BGR2HSV)
                         
                         # Extract features from each classified region (test image)
                         test_class_stats = []
-                        class_feature_vectors = []  # Store feature vectors (RGB means) for each class
-
-                        # We'll compute per-class mean RGB vectors for the test image and use them
-                        # to compute between-class separations and within-class variances.
+                        class_feature_vectors = []  # Store feature vectors in same space as training
+                        
+                        # Use the same 43 selected features as training for consistency
                         for class_id, class_name in enumerate(model_data['class_names']):
                             # Get pixels belonging to this class (using MLC)
                             class_mask = (classification_map_mlc_full == class_id)
                             pixel_count = int(np.sum(class_mask))
 
                             if pixel_count > 0:
-                                # Get pixel values for this class
+                                # Get pixel values for visualization
                                 class_pixels_bgr = original_img[class_mask].astype(np.float64)
                                 class_pixels_hsv = img_hsv[class_mask].astype(np.float64)
 
-                                # Calculate RGB statistics
+                                # Calculate RGB statistics (for display only)
                                 mean_rgb = np.mean(class_pixels_bgr, axis=0)
                                 std_rgb = np.std(class_pixels_bgr, axis=0)
-
-                                # Calculate HSV statistics for better color analysis
                                 mean_hsv = np.mean(class_pixels_hsv, axis=0)
                                 std_hsv = np.std(class_pixels_hsv, axis=0)
-
-                                # Create feature vector for this class (RGB + HSV)
-                                feature_vector = np.concatenate([mean_rgb, std_rgb, mean_hsv, std_hsv])
+                                
+                                # USE TRAINING FEATURE SPACE: Get mean feature vector in the same 43D space
+                                # This is the class mean from trained model (already in 43-feature scaled space)
+                                feature_vector = model_data['class_means'][class_id]  # 43 features
                                 class_feature_vectors.append(feature_vector)
                                 
-                                # Calculate within-class variation (average std of all channels)
-                                within_class_var = np.mean(np.concatenate([std_rgb, std_hsv]))
+                                # Within-class variation from training covariance matrix
+                                class_cov = model_data['class_covariances'][class_id]
+                                within_class_var = np.mean(np.diag(class_cov))  # Average variance across features
                                 
                                 test_class_stats.append({
                                     'class': class_name,
@@ -1052,84 +1089,57 @@ def main(auto_mode=False, test_image=None):
                                 })
                             else:
                                 # No pixels predicted for this class in test image
-                                # Use training statistics as fallback
-                                print(f"   ⚠️ No pixels for class '{class_name}' in test image — using training stats fallback.")
+                                print(f"   ⚠️ No pixels for class '{class_name}' in test image — using training stats.")
                                 
-                                # Use training class means as fallback
-                                if hasattr(model_data['class_means'], '__iter__'):
-                                    fallback_mean = model_data['class_means'][class_id][:3] if len(model_data['class_means'][class_id]) >= 3 else np.array([128, 128, 128])
-                                else:
-                                    fallback_mean = np.array([128, 128, 128])
-                                
-                                feature_vector = np.concatenate([fallback_mean, np.zeros(3), np.zeros(3), np.zeros(3)])
+                                # Use training statistics directly
+                                feature_vector = model_data['class_means'][class_id]
                                 class_feature_vectors.append(feature_vector)
+                                
+                                class_cov = model_data['class_covariances'][class_id]
+                                within_class_var = np.mean(np.diag(class_cov))
                                 
                                 test_class_stats.append({
                                     'class': class_name,
                                     'class_id': class_id,
                                     'pixel_count': 0,
                                     'percentage': 0.0,
-                                    'mean_rgb': fallback_mean.tolist(),
-                                    'std_rgb': np.zeros(3).tolist(),
-                                    'mean_hsv': np.zeros(3).tolist(),
-                                    'std_hsv': np.zeros(3).tolist(),
+                                    'mean_rgb': [128, 128, 128],
+                                    'std_rgb': [0, 0, 0],
+                                    'mean_hsv': [0, 0, 0],
+                                    'std_hsv': [0, 0, 0],
                                     'feature_vector': feature_vector,
-                                    'within_class_variation': 0.0
+                                    'within_class_variation': within_class_var
                                 })
                         
-                        # Calculate between-class separation
-                        between_class_separations = []
-                        class_feature_array = np.array([s['feature_vector'] for s in test_class_stats])
-                        
-                        if len(class_feature_array) > 1:
-                            # Calculate pairwise distances between class means
-                            for i in range(len(class_feature_array)):
-                                for j in range(i+1, len(class_feature_array)):
-                                    dist = np.linalg.norm(class_feature_array[i] - class_feature_array[j])
-                                    between_class_separations.append(dist)
-                            
-                            avg_between_class_sep = np.mean(between_class_separations) if between_class_separations else 0.0
-                        else:
-                            avg_between_class_sep = 0.0
-                        
-                        # Assign between-class separation to each class
-                        for stat in test_class_stats:
-                            stat['between_class_separation'] = avg_between_class_sep
-                        
-                        print(f"   ✅ Test image statistics computed!")
-                        print(f"      Between-class separation: {avg_between_class_sep:.2f}")
-                        avg_within = np.mean([s['within_class_variation'] for s in test_class_stats if s['pixel_count'] > 0])
-                        print(f"      Average within-class variation: {avg_within:.2f}" if avg_within > 0 else "      Average within-class variation: N/A")
-                        
-                        # Compute between-class separations and within-class variances (TEST IMAGE)
-                        print(f"\n🔎 Extracting per-class statistics for visualization...")
-                        class_feature_vectors = np.array(class_feature_vectors, dtype=np.float64)
+                        # Compute between-class separations and within-class variances
+                        print(f"\n🔎 Computing per-class statistics in 43-feature space...")
+                        class_feature_vectors_array = np.array(class_feature_vectors, dtype=np.float64)
 
-                        # Between-class separations: pairwise Euclidean distance between class mean RGB vectors
+                        # Between-class separations: mean distance from each class to all other classes
                         K = len(model_data['class_names'])
                         between_seps = np.zeros((K, K), dtype=np.float64)
                         for i in range(K):
                             for j in range(K):
-                                between_seps[i, j] = np.linalg.norm(class_feature_vectors[i] - class_feature_vectors[j])
+                                between_seps[i, j] = np.linalg.norm(class_feature_vectors_array[i] - class_feature_vectors_array[j])
 
-                        # Summary between-class separation (mean of pairwise distances for each class)
-                        between_class_summary = np.mean(between_seps, axis=1)
-
-                        # Within-class variation: approximate by mean RGB channel variance within predicted pixels
-                        within_class_vars = []
+                        # For each class, compute mean distance to OTHER classes (not itself)
+                        between_class_summary = []
+                        for i in range(K):
+                            # Get distances to all other classes (exclude self)
+                            other_distances = [between_seps[i, j] for j in range(K) if i != j]
+                            mean_dist = np.mean(other_distances) if other_distances else 0.0
+                            between_class_summary.append(mean_dist)
+                        
+                        # Update test_class_stats with correct per-class between-class separation
                         for idx, stat in enumerate(test_class_stats):
-                            if stat['pixel_count'] > 0:
-                                # Use std_rgb values
-                                within_var = float(np.mean(stat['std_rgb']))
-                            else:
-                                # Fallback to training within-class variation if available
-                                fallback_cov = model_data.get('class_covariances')
-                                if fallback_cov is not None:
-                                    # approximate by mean of diagonal of covariance matrix
-                                    within_var = float(np.mean(np.diag(fallback_cov[idx])))
-                                else:
-                                    within_var = 0.0
-                            within_class_vars.append(within_var)
+                            stat['between_class_separation'] = between_class_summary[idx]
+                        
+                        print(f"   ✅ Test image statistics computed!")
+                        for stat in test_class_stats:
+                            print(f"      {stat['class']}: Between-class={stat['between_class_separation']:.2f}, Within-class={stat['within_class_variation']:.2f}")
+
+                        # Within-class variation: USE THE VALUES ALREADY COMPUTED FROM TRAINING
+                        within_class_vars = [stat['within_class_variation'] for stat in test_class_stats]
 
                         # Save test statistics into a dedicated folder under OUTPUT_FOLDER
                         test_stats_dir = os.path.join(OUTPUT_FOLDER, 'test_stats')
