@@ -12,7 +12,6 @@ __pycache__/
 
 # Model and output files
 trained_model_hierarchical.pkl
-output/
 
 # OS files
 .DS_Store
@@ -27,8 +26,7 @@ Thumbs.db
 *.log
 *.bak
 
-# Test images
-image*.jpg
+
 
 # Ignore satellite data (if large)
 satellite/EuroSATallBands/
