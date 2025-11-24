@@ -1536,19 +1536,10 @@ def main(auto_mode=False, test_image=None):
                         test_stats_df.to_csv(test_stats_path, index=False)
                         print(f"   ✅ Test statistics saved to: test_image_statistics.csv")
                         
-                        # Save classification maps as separate images
-                        print(f"\n💾 Saving individual classification maps...")
-                        cv2.imwrite(os.path.join(OUTPUT_FOLDER, 'mdc_classification_map.png'), colored_map_mdc)
-                        cv2.imwrite(os.path.join(OUTPUT_FOLDER, 'mlc_classification_map.png'), colored_map_mlc)
-                        print(f"   ✅ MDC map saved: mdc_classification_map.png")
-                        print(f"   ✅ MLC map saved: mlc_classification_map.png")
-                        
                         # Summary of all files
                         print(f"\n✨ Test Image Results saved in: {OUTPUT_FOLDER}")
                         print(f"   📊 Classification Maps:")
                         print(f"      - classified_result.png (comprehensive 3-panel visualization)")
-                        print(f"      - mdc_classification_map.png (MDC pixel classification)")
-                        print(f"      - mlc_classification_map.png (MLC pixel classification)")
                         print(f"   📈 Statistics:")
                         print(f"      - test_image_statistics.csv (summary stats)")
                         print(f"      - test_stats/test_image_class_stats.csv (detailed per-class stats)")
